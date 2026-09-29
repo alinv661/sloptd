@@ -1,4 +1,4 @@
--- Slop TD Panic Sell Addon v3 (Robust queue + movable window + persistence)
+-- Slop TD Panic Sell Addon v4 (Auto Skip After Wave + persistent window)
 -- Drop this in your executor's autoexecute folder.
 
 local Players = game:GetService("Players")
@@ -44,6 +44,9 @@ local Defaults = {
     WindowY = 200,
     Minimized = false,
     Closed = false,
+    -- Auto skip
+    AutoSkipAfterWave = false,
+    AutoSkipWave = 30,
 }
 
 local function LoadPanicConfig()
@@ -64,6 +67,8 @@ local function LoadPanicConfig()
         WindowY = tonumber(decoded.WindowY) or Defaults.WindowY,
         Minimized = decoded.Minimized == true,
         Closed = decoded.Closed == true,
+        AutoSkipAfterWave = decoded.AutoSkipAfterWave == true,
+        AutoSkipWave = math.clamp(math.floor(tonumber(decoded.AutoSkipWave) or Defaults.AutoSkipWave), 1, 500),
     }
 end
 
@@ -76,9 +81,6 @@ end
 
 -- ============================================================
 -- Queue on teleport
---   - Only runs the hub if it isn't already loaded/booting.
---   - ALWAYS runs the addon, regardless of hub state.
---   - The addon itself is responsible for waiting for the hub.
 -- ============================================================
 local function GetQueueOnTeleport()
     if type(queue_on_teleport) == "function" then return queue_on_teleport end
@@ -100,7 +102,6 @@ local function QueuePanicOnTeleport()
 if not game:IsLoaded() then game.Loaded:Wait() end
 task.wait(2)
 
--- Run the hub only if nothing is already loading/loaded
 local boot = getgenv().__SlopTDHubBoot
 local hubReady = getgenv().SlopTDHub ~= nil
 local hubBooting = boot and boot.Loading == true
@@ -115,7 +116,6 @@ if not hubReady and not hubBooting then
     task.wait(2)
 end
 
--- Always run the addon. It waits for the hub internally.
 local addonURL = "https://raw.githubusercontent.com/alinv661/sloptd/refs/heads/main/sumlikethat"
 pcall(function()
     local source = game:HttpGet(addonURL)
@@ -127,7 +127,7 @@ end)
 end
 
 -- ============================================================
--- Wait for the hub (patient — up to 3 minutes)
+-- Wait for the hub
 -- ============================================================
 local function WaitForHub(timeout)
     local deadline = os.clock() + (timeout or 180)
@@ -150,7 +150,6 @@ end
 
 local State = Hub.State
 
--- Clear a potentially stuck boot flag so nothing else trips on it
 local boot = genv.__SlopTDHubBoot
 if boot and boot.Loading == true then
     boot.Loading = false
@@ -180,6 +179,11 @@ local WindowY = SavedCfg.WindowY
 local Minimized = SavedCfg.Minimized
 local Closed = SavedCfg.Closed
 
+-- Auto skip settings (kept local to this addon, saved to same file)
+local AutoSkipAfterWave = SavedCfg.AutoSkipAfterWave
+local AutoSkipWave = SavedCfg.AutoSkipWave
+local LastSkipRequest = 0
+
 local lastSaved = {}
 local function SnapshotState()
     return {
@@ -190,6 +194,8 @@ local function SnapshotState()
         WindowY = WindowY,
         Minimized = Minimized,
         Closed = Closed,
+        AutoSkipAfterWave = AutoSkipAfterWave,
+        AutoSkipWave = AutoSkipWave,
     }
 end
 
@@ -253,6 +259,39 @@ local function GetBaseHealthNumber()
 end
 
 -- ============================================================
+-- Remote helpers (for skip)
+-- ============================================================
+local function GetSkipRemote()
+    local Functions = ReplicatedStorage:FindFirstChild("Functions")
+    return Functions and Functions:FindFirstChild("VoteSkip")
+end
+
+local function IsSkipAvailable()
+    -- Prefer the game's own UI signal
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local gg = pg and pg:FindFirstChild("GameGui")
+    local skipGui = gg and gg:FindFirstChild("WaveSkipGui")
+    if skipGui then
+        if skipGui:IsA("LayerCollector") then return skipGui.Enabled end
+        if skipGui:IsA("GuiObject") then return skipGui.Visible end
+    end
+    -- Fallback to Info values
+    local info = GetInfoFolder()
+    local cur = tonumber((info and info:FindFirstChild("VoteSkipValue")
+        and info.VoteSkipValue.Value) or 0) or 0
+    local need = tonumber((info and info:FindFirstChild("VoteSkipPlrValue")
+        and info.VoteSkipPlrValue.Value) or 0) or 0
+    return need > 0 and cur < need
+end
+
+local function TrySkip()
+    local remote = GetSkipRemote()
+    if not remote then return false end
+    local ok = pcall(remote.InvokeServer, remote)
+    return ok
+end
+
+-- ============================================================
 -- Sell logic
 -- ============================================================
 local function SellAllOwnTowers()
@@ -301,7 +340,7 @@ local function Notify(title, content)
 end
 
 -- ============================================================
--- Watchdog
+-- Watchdog — panic sell
 -- ============================================================
 task.spawn(function()
     while State.Running do
@@ -343,6 +382,29 @@ task.spawn(function()
     end
 end)
 
+-- ============================================================
+-- Watchdog — auto skip after wave
+-- ============================================================
+task.spawn(function()
+    while State.Running do
+        if AutoSkipAfterWave and IsGameRunning() and GetWave() >= AutoSkipWave then
+            if IsSkipAvailable() and (os.clock() - LastSkipRequest) >= 1.5 then
+                LastSkipRequest = os.clock()
+                task.spawn(function()
+                    local ok = TrySkip()
+                    if ok then
+                        print(string.format("[Panic Sell] Skip requested at wave %d", GetWave()))
+                    end
+                end)
+            end
+        end
+        task.wait(0.5)
+    end
+end)
+
+-- ============================================================
+-- Watchdog — reset trigger each match
+-- ============================================================
 task.spawn(function()
     local lastSerial = State.MatchSerial
     while State.Running do
@@ -363,7 +425,7 @@ local function UpdateMinimizeVisual()
     if not Body then return end
     Body.Visible = not Minimized
     if Window then
-        Window.Size = Minimized and UDim2.fromOffset(240, 32) or UDim2.fromOffset(240, 170)
+        Window.Size = Minimized and UDim2.fromOffset(240, 32) or UDim2.fromOffset(240, 240)
     end
     if MinimizeBtn then
         MinimizeBtn.Text = Minimized and "+" or "—"
@@ -391,7 +453,7 @@ local function MakeControlPanel()
     -- ============ Main Window ============
     local frame = Instance.new("Frame")
     frame.Name = "Window"
-    frame.Size = UDim2.fromOffset(240, 170)
+    frame.Size = UDim2.fromOffset(240, 240)
     frame.Position = UDim2.fromOffset(WindowX, WindowY)
     frame.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
     frame.BorderSizePixel = 0
@@ -444,7 +506,7 @@ local function MakeControlPanel()
     titleText.Size = UDim2.new(1, -70, 1, 0)
     titleText.Position = UDim2.fromOffset(10, 0)
     titleText.BackgroundTransparency = 1
-    titleText.Text = "Panic Sell"
+    titleText.Text = "Slop TD Addon"
     titleText.TextColor3 = Color3.fromRGB(240, 240, 240)
     titleText.Font = Enum.Font.GothamBold
     titleText.TextSize = 14
@@ -489,13 +551,25 @@ local function MakeControlPanel()
     Body.BackgroundTransparency = 1
     Body.Parent = frame
 
+    -- ---------- Section: Panic Sell ----------
+    local section1 = Instance.new("TextLabel")
+    section1.Size = UDim2.new(1, -20, 0, 18)
+    section1.Position = UDim2.fromOffset(10, 6)
+    section1.BackgroundTransparency = 1
+    section1.Text = "PANIC SELL"
+    section1.TextColor3 = Color3.fromRGB(120, 200, 150)
+    section1.Font = Enum.Font.GothamBold
+    section1.TextSize = 11
+    section1.TextXAlignment = Enum.TextXAlignment.Left
+    section1.Parent = Body
+
     local toggle = Instance.new("TextButton")
-    toggle.Size = UDim2.new(1, -20, 0, 28)
-    toggle.Position = UDim2.fromOffset(10, 8)
+    toggle.Size = UDim2.new(1, -20, 0, 26)
+    toggle.Position = UDim2.fromOffset(10, 26)
     toggle.BackgroundColor3 = State.AutoSellLowHp and Color3.fromRGB(46, 180, 92) or Color3.fromRGB(50, 50, 60)
     toggle.TextColor3 = Color3.fromRGB(240, 240, 240)
     toggle.Font = Enum.Font.GothamSemibold
-    toggle.TextSize = 13
+    toggle.TextSize = 12
     toggle.Text = State.AutoSellLowHp and "Enabled" or "Disabled"
     toggle.BorderSizePixel = 0
     toggle.Parent = Body
@@ -513,8 +587,8 @@ local function MakeControlPanel()
 
     -- HP Threshold row
     local hpRow = Instance.new("Frame")
-    hpRow.Size = UDim2.new(1, -20, 0, 26)
-    hpRow.Position = UDim2.fromOffset(10, 42)
+    hpRow.Size = UDim2.new(1, -20, 0, 24)
+    hpRow.Position = UDim2.fromOffset(10, 58)
     hpRow.BackgroundColor3 = Color3.fromRGB(32, 32, 40)
     hpRow.BorderSizePixel = 0
     hpRow.Parent = Body
@@ -530,18 +604,18 @@ local function MakeControlPanel()
     hpLabel.Text = "HP Threshold"
     hpLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
     hpLabel.Font = Enum.Font.Gotham
-    hpLabel.TextSize = 12
+    hpLabel.TextSize = 11
     hpLabel.TextXAlignment = Enum.TextXAlignment.Left
     hpLabel.Parent = hpRow
 
     local hpValue = Instance.new("TextButton")
-    hpValue.Size = UDim2.new(0.4, -8, 1, -6)
-    hpValue.Position = UDim2.new(0.6, 0, 0, 3)
+    hpValue.Size = UDim2.new(0.4, -8, 1, -4)
+    hpValue.Position = UDim2.new(0.6, 0, 0, 2)
     hpValue.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
     hpValue.Text = tostring(State.AutoSellLowHpThreshold)
     hpValue.TextColor3 = Color3.fromRGB(240, 240, 240)
     hpValue.Font = Enum.Font.GothamSemibold
-    hpValue.TextSize = 12
+    hpValue.TextSize = 11
     hpValue.BorderSizePixel = 0
     hpValue.Parent = hpRow
 
@@ -562,8 +636,8 @@ local function MakeControlPanel()
 
     -- Wave Limit row
     local waveRow = Instance.new("Frame")
-    waveRow.Size = UDim2.new(1, -20, 0, 26)
-    waveRow.Position = UDim2.fromOffset(10, 74)
+    waveRow.Size = UDim2.new(1, -20, 0, 24)
+    waveRow.Position = UDim2.fromOffset(10, 86)
     waveRow.BackgroundColor3 = Color3.fromRGB(32, 32, 40)
     waveRow.BorderSizePixel = 0
     waveRow.Parent = Body
@@ -579,18 +653,18 @@ local function MakeControlPanel()
     waveLabel.Text = "Wave Limit"
     waveLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
     waveLabel.Font = Enum.Font.Gotham
-    waveLabel.TextSize = 12
+    waveLabel.TextSize = 11
     waveLabel.TextXAlignment = Enum.TextXAlignment.Left
     waveLabel.Parent = waveRow
 
     local waveValue = Instance.new("TextButton")
-    waveValue.Size = UDim2.new(0.4, -8, 1, -6)
-    waveValue.Position = UDim2.new(0.6, 0, 0, 3)
+    waveValue.Size = UDim2.new(0.4, -8, 1, -4)
+    waveValue.Position = UDim2.new(0.6, 0, 0, 2)
     waveValue.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
     waveValue.Text = tostring(State.AutoSellLowHpWaveLimit)
     waveValue.TextColor3 = Color3.fromRGB(240, 240, 240)
     waveValue.Font = Enum.Font.GothamSemibold
-    waveValue.TextSize = 12
+    waveValue.TextSize = 11
     waveValue.BorderSizePixel = 0
     waveValue.Parent = waveRow
 
@@ -609,45 +683,133 @@ local function MakeControlPanel()
         PersistIfChanged()
     end)
 
+    -- ---------- Section: Auto Skip ----------
+    local section2 = Instance.new("TextLabel")
+    section2.Size = UDim2.new(1, -20, 0, 18)
+    section2.Position = UDim2.fromOffset(10, 116)
+    section2.BackgroundTransparency = 1
+    section2.Text = "AUTO SKIP"
+    section2.TextColor3 = Color3.fromRGB(120, 170, 220)
+    section2.Font = Enum.Font.GothamBold
+    section2.TextSize = 11
+    section2.TextXAlignment = Enum.TextXAlignment.Left
+    section2.Parent = Body
+
+    local skipToggle = Instance.new("TextButton")
+    skipToggle.Size = UDim2.new(1, -20, 0, 26)
+    skipToggle.Position = UDim2.fromOffset(10, 136)
+    skipToggle.BackgroundColor3 = AutoSkipAfterWave and Color3.fromRGB(46, 130, 200) or Color3.fromRGB(50, 50, 60)
+    skipToggle.TextColor3 = Color3.fromRGB(240, 240, 240)
+    skipToggle.Font = Enum.Font.GothamSemibold
+    skipToggle.TextSize = 12
+    skipToggle.Text = AutoSkipAfterWave and "Enabled" or "Disabled"
+    skipToggle.BorderSizePixel = 0
+    skipToggle.Parent = Body
+
+    local skipCorner = Instance.new("UICorner")
+    skipCorner.CornerRadius = UDim.new(0, 6)
+    skipCorner.Parent = skipToggle
+
+    skipToggle.MouseButton1Click:Connect(function()
+        AutoSkipAfterWave = not AutoSkipAfterWave
+        skipToggle.Text = AutoSkipAfterWave and "Enabled" or "Disabled"
+        skipToggle.BackgroundColor3 = AutoSkipAfterWave and Color3.fromRGB(46, 130, 200) or Color3.fromRGB(50, 50, 60)
+        PersistIfChanged()
+    end)
+
+    -- Skip Wave row
+    local skipRow = Instance.new("Frame")
+    skipRow.Size = UDim2.new(1, -20, 0, 24)
+    skipRow.Position = UDim2.fromOffset(10, 168)
+    skipRow.BackgroundColor3 = Color3.fromRGB(32, 32, 40)
+    skipRow.BorderSizePixel = 0
+    skipRow.Parent = Body
+
+    local skipCorner2 = Instance.new("UICorner")
+    skipCorner2.CornerRadius = UDim.new(0, 6)
+    skipCorner2.Parent = skipRow
+
+    local skipLabel = Instance.new("TextLabel")
+    skipLabel.Size = UDim2.new(0.6, 0, 1, 0)
+    skipLabel.Position = UDim2.fromOffset(8, 0)
+    skipLabel.BackgroundTransparency = 1
+    skipLabel.Text = "Skip After Wave"
+    skipLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
+    skipLabel.Font = Enum.Font.Gotham
+    skipLabel.TextSize = 11
+    skipLabel.TextXAlignment = Enum.TextXAlignment.Left
+    skipLabel.Parent = skipRow
+
+    local skipValue = Instance.new("TextButton")
+    skipValue.Size = UDim2.new(0.4, -8, 1, -4)
+    skipValue.Position = UDim2.new(0.6, 0, 0, 2)
+    skipValue.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+    skipValue.Text = tostring(AutoSkipWave)
+    skipValue.TextColor3 = Color3.fromRGB(240, 240, 240)
+    skipValue.Font = Enum.Font.GothamSemibold
+    skipValue.TextSize = 11
+    skipValue.BorderSizePixel = 0
+    skipValue.Parent = skipRow
+
+    local skipValCorner = Instance.new("UICorner")
+    skipValCorner.CornerRadius = UDim.new(0, 4)
+    skipValCorner.Parent = skipValue
+
+    skipValue.MouseButton1Click:Connect(function()
+        local presets = { 5, 10, 15, 20, 25, 30, 40, 50, 75, 100, 150 }
+        local idx = 1
+        for i, v in ipairs(presets) do
+            if AutoSkipWave <= v then idx = i break end
+        end
+        AutoSkipWave = presets[(idx % #presets) + 1]
+        skipValue.Text = tostring(AutoSkipWave)
+        PersistIfChanged()
+    end)
+
     -- Status line
     local status = Instance.new("TextLabel")
-    status.Size = UDim2.new(1, -20, 0, 20)
-    status.Position = UDim2.fromOffset(10, 108)
+    status.Size = UDim2.new(1, -20, 0, 16)
+    status.Position = UDim2.fromOffset(10, 196)
     status.BackgroundTransparency = 1
     status.Text = "Idle"
     status.TextColor3 = Color3.fromRGB(150, 150, 160)
     status.Font = Enum.Font.Gotham
-    status.TextSize = 11
+    status.TextSize = 10
     status.TextXAlignment = Enum.TextXAlignment.Left
     status.Parent = Body
 
     task.spawn(function()
         while status.Parent do
             local active = IsGameRunning() and GetWave() >= 1
-            if not State.AutoSellLowHp then
-                status.Text = "Disabled"
-                status.TextColor3 = Color3.fromRGB(150, 150, 160)
-            elseif not active then
+            if not active then
                 status.Text = "Waiting for match"
                 status.TextColor3 = Color3.fromRGB(150, 150, 160)
             else
                 local wave = GetWave()
-                if wave > State.AutoSellLowHpWaveLimit then
-                    status.Text = "Wave past limit"
-                    status.TextColor3 = Color3.fromRGB(200, 160, 60)
-                else
-                    local hp = GetBaseHealthNumber()
-                    if hp then
-                        status.Text = string.format("HP: %d (wave %d)", math.floor(hp), wave)
-                        if hp < State.AutoSellLowHpThreshold then
-                            status.TextColor3 = Color3.fromRGB(230, 80, 80)
-                        else
-                            status.TextColor3 = Color3.fromRGB(150, 200, 150)
-                        end
+                local parts = {}
+                if State.AutoSellLowHp then
+                    if wave > State.AutoSellLowHpWaveLimit then
+                        table.insert(parts, "sell:past limit")
                     else
-                        status.Text = "Wave " .. tostring(wave)
-                        status.TextColor3 = Color3.fromRGB(150, 150, 160)
+                        local hp = GetBaseHealthNumber()
+                        if hp then
+                            table.insert(parts, string.format("HP %d", math.floor(hp)))
+                        end
                     end
+                end
+                if AutoSkipAfterWave then
+                    if wave >= AutoSkipWave then
+                        table.insert(parts, "skip:active")
+                    else
+                        table.insert(parts, string.format("skip@%d", AutoSkipWave))
+                    end
+                end
+                if #parts > 0 then
+                    status.Text = "Wave " .. tostring(wave) .. " | " .. table.concat(parts, " | ")
+                    status.TextColor3 = Color3.fromRGB(150, 200, 150)
+                else
+                    status.Text = "Wave " .. tostring(wave) .. " | both off"
+                    status.TextColor3 = Color3.fromRGB(150, 150, 160)
                 end
             end
             task.wait(0.4)
@@ -660,7 +822,7 @@ local function MakeControlPanel()
     ReopenBtn.Size = UDim2.fromOffset(90, 28)
     ReopenBtn.Position = UDim2.fromOffset(WindowX, WindowY)
     ReopenBtn.BackgroundColor3 = Color3.fromRGB(46, 180, 92)
-    ReopenBtn.Text = "Panic Sell"
+    ReopenBtn.Text = "Slop TD Addon"
     ReopenBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
     ReopenBtn.Font = Enum.Font.GothamSemibold
     ReopenBtn.TextSize = 12
@@ -678,7 +840,7 @@ local function MakeControlPanel()
         PersistIfChanged()
     end)
 
-    -- Dragging the window
+    -- Dragging
     local dragging = false
     local dragStart, startPos
 
@@ -710,7 +872,6 @@ local function MakeControlPanel()
         end
     end)
 
-    -- Dragging the reopen button
     local reopenDragging = false
     local reopenDragStart, reopenStartPos
 
@@ -754,7 +915,6 @@ local function MakeControlPanel()
         PersistIfChanged()
     end)
 
-    -- Hover effects
     local function addHover(btn, baseColor, hoverColor)
         btn.MouseEnter:Connect(function() btn.BackgroundColor3 = hoverColor end)
         btn.MouseLeave:Connect(function() btn.BackgroundColor3 = baseColor end)
@@ -772,7 +932,6 @@ end
 MakeControlPanel()
 QueuePanicOnTeleport()
 
--- Release the addon guard so it can reattach on the next join/teleport.
 genv.__PanicSellLoading = false
 
-print("[Panic Sell] Addon v3 loaded. Drag title bar to move, — to minimize, ✕ to close.")
+print("[Panic Sell] Addon v4 loaded. Sections: Panic Sell + Auto Skip.")
