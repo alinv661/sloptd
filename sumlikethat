@@ -10,6 +10,14 @@ local CoreGui = game:GetService("CoreGui")
 
 local LocalPlayer = Players.LocalPlayer
 
+-- Prevent double-launch (e.g. autoexecute + queued-on-teleport firing together)
+local genv = getgenv()
+if genv.__PanicSellLoading then
+    warn("[Panic Sell] Duplicate concurrent launch blocked")
+    return
+end
+genv.__PanicSellLoading = true
+
 -- ============================================================
 -- Persistence
 -- ============================================================
@@ -65,7 +73,7 @@ local function SavePanicConfig(cfg)
 end
 
 -- ============================================================
--- Auto-Execute (queue on teleport)
+-- Auto-Execute (queue ONLY the addon on teleport, never the hub)
 -- ============================================================
 local function GetQueueOnTeleport()
     if type(queue_on_teleport) == "function" then return queue_on_teleport end
@@ -84,15 +92,19 @@ local function QueuePanicOnTeleport()
     if not queue then return false end
     local queuedSource = [[
 if not game:IsLoaded() then game.Loaded:Wait() end
-task.wait(2)
-local hubURL = "https://raw.githubusercontent.com/KeroTwT/Kero-Hub/refs/heads/main/Slop%20TD"
-local addonURL = "https://raw.githubusercontent.com/YOU/YOUR-REPO/main/SlopTD_PanicSell.lua"
-pcall(function()
-    local source = game:HttpGet(hubURL)
-    local chunk = loadstring(source)
-    if chunk then chunk() end
-end)
-task.wait(1)
+task.wait(3)
+
+-- Wait for the hub's own boot flag to clear so we don't race it.
+-- The hub sets __SlopTDHubBoot.Loading = false when it finishes loading.
+local boot = getgenv().__SlopTDHubBoot
+local deadline = os.clock() + 60
+while boot and boot.Loading == true and os.clock() < deadline do
+    task.wait(0.3)
+    boot = getgenv().__SlopTDHubBoot
+end
+
+-- Only fetch the addon. Do NOT re-run the hub here — the hub auto-executes itself.
+local addonURL = "https://raw.githubusercontent.com/alinv661/sloptd/refs/heads/main/sumlikethat"
 pcall(function()
     local source = game:HttpGet(addonURL)
     local chunk = loadstring(source)
@@ -120,6 +132,7 @@ end
 local Hub = WaitForHub(60)
 if not Hub then
     warn("[Panic Sell] Slop TD Hub did not load within 60s. Aborting.")
+    genv.__PanicSellLoading = false
     return
 end
 
@@ -401,7 +414,6 @@ local function MakeControlPanel()
     tbCorner.CornerRadius = UDim.new(0, 10)
     tbCorner.Parent = titleBar
 
-    -- Cover the bottom corners so the top stays rounded
     local tbMask = Instance.new("Frame")
     tbMask.Size = UDim2.new(1, 0, 0, 10)
     tbMask.Position = UDim2.new(0, 0, 1, -10)
@@ -420,7 +432,6 @@ local function MakeControlPanel()
     titleText.TextXAlignment = Enum.TextXAlignment.Left
     titleText.Parent = titleBar
 
-    -- Minimize button
     MinimizeBtn = Instance.new("TextButton")
     MinimizeBtn.Size = UDim2.fromOffset(24, 24)
     MinimizeBtn.Position = UDim2.new(1, -56, 0, 4)
@@ -436,7 +447,6 @@ local function MakeControlPanel()
     minCorner.CornerRadius = UDim.new(0, 6)
     minCorner.Parent = MinimizeBtn
 
-    -- Close button
     CloseBtn = Instance.new("TextButton")
     CloseBtn.Size = UDim2.fromOffset(24, 24)
     CloseBtn.Position = UDim2.new(1, -28, 0, 4)
@@ -460,7 +470,6 @@ local function MakeControlPanel()
     Body.BackgroundTransparency = 1
     Body.Parent = frame
 
-    -- Enable/Disable toggle
     local toggle = Instance.new("TextButton")
     toggle.Size = UDim2.new(1, -20, 0, 28)
     toggle.Position = UDim2.fromOffset(10, 8)
@@ -483,7 +492,6 @@ local function MakeControlPanel()
         PersistIfChanged()
     end)
 
-    -- HP Threshold row
     local hpRow = Instance.new("Frame")
     hpRow.Size = UDim2.new(1, -20, 0, 26)
     hpRow.Position = UDim2.fromOffset(10, 42)
@@ -532,7 +540,6 @@ local function MakeControlPanel()
         PersistIfChanged()
     end)
 
-    -- Wave Limit row
     local waveRow = Instance.new("Frame")
     waveRow.Size = UDim2.new(1, -20, 0, 26)
     waveRow.Position = UDim2.fromOffset(10, 74)
@@ -581,7 +588,6 @@ local function MakeControlPanel()
         PersistIfChanged()
     end)
 
-    -- Status line
     local status = Instance.new("TextLabel")
     status.Size = UDim2.new(1, -20, 0, 20)
     status.Position = UDim2.fromOffset(10, 108)
@@ -593,7 +599,6 @@ local function MakeControlPanel()
     status.TextXAlignment = Enum.TextXAlignment.Left
     status.Parent = Body
 
-    -- Live status updater
     task.spawn(function()
         while status.Parent do
             local active = IsGameRunning() and GetWave() >= 1
@@ -627,7 +632,6 @@ local function MakeControlPanel()
         end
     end)
 
-    -- ============ Reopen button ============
     ReopenBtn = Instance.new("TextButton")
     ReopenBtn.Name = "ReopenBtn"
     ReopenBtn.Size = UDim2.fromOffset(90, 28)
@@ -651,7 +655,6 @@ local function MakeControlPanel()
         PersistIfChanged()
     end)
 
-    -- ============ Dragging ============
     local dragging = false
     local dragStart, startPos
 
@@ -683,7 +686,6 @@ local function MakeControlPanel()
         end
     end)
 
-    -- Same for reopen button
     local reopenDragging = false
     local reopenDragStart, reopenStartPos
 
@@ -715,7 +717,6 @@ local function MakeControlPanel()
         end
     end)
 
-    -- ============ Buttons ============
     MinimizeBtn.MouseButton1Click:Connect(function()
         Minimized = not Minimized
         UpdateMinimizeVisual()
@@ -728,7 +729,6 @@ local function MakeControlPanel()
         PersistIfChanged()
     end)
 
-    -- Hover effects
     local function addHover(btn, baseColor, hoverColor)
         btn.MouseEnter:Connect(function() btn.BackgroundColor3 = hoverColor end)
         btn.MouseLeave:Connect(function() btn.BackgroundColor3 = baseColor end)
@@ -737,7 +737,6 @@ local function MakeControlPanel()
     addHover(CloseBtn, Color3.fromRGB(180, 50, 50), Color3.fromRGB(220, 70, 70))
     addHover(ReopenBtn, Color3.fromRGB(46, 180, 92), Color3.fromRGB(60, 200, 110))
 
-    -- Apply saved state
     UpdateMinimizeVisual()
     UpdateCloseVisual()
 
@@ -746,5 +745,8 @@ end
 
 MakeControlPanel()
 QueuePanicOnTeleport()
+
+-- Release the guard so a future run (e.g. after a manual re-execute) works.
+genv.__PanicSellLoading = false
 
 print("[Panic Sell] Addon v2 loaded. Drag title bar to move, — to minimize, ✕ to close.")
