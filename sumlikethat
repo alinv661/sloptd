@@ -1,0 +1,750 @@
+-- Slop TD Panic Sell Addon v2 (Movable + Minimizable + Persistent)
+-- Drop this in your executor's autoexecute folder.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local HttpService = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- ============================================================
+-- Persistence
+-- ============================================================
+local CONFIG_FOLDER = "SlopTD_Macros"
+local PANIC_CONFIG = CONFIG_FOLDER .. "/PanicSell.json"
+
+local HasFilesystem = type(isfolder) == "function"
+    and type(makefolder) == "function"
+    and type(isfile) == "function"
+    and type(readfile) == "function"
+    and type(writefile) == "function"
+
+if HasFilesystem and not isfolder(CONFIG_FOLDER) then
+    pcall(makefolder, CONFIG_FOLDER)
+end
+
+local Defaults = {
+    Enabled = false,
+    HpThreshold = 99,
+    WaveLimit = 49,
+    WindowX = 20,
+    WindowY = 200,
+    Minimized = false,
+    Closed = false,
+}
+
+local function LoadPanicConfig()
+    if not HasFilesystem or not isfile(PANIC_CONFIG) then
+        return table.clone(Defaults)
+    end
+    local ok, decoded = pcall(function()
+        return HttpService:JSONDecode(readfile(PANIC_CONFIG))
+    end)
+    if not ok or type(decoded) ~= "table" then
+        return table.clone(Defaults)
+    end
+    return {
+        Enabled = decoded.Enabled == true,
+        HpThreshold = math.clamp(math.floor(tonumber(decoded.HpThreshold) or Defaults.HpThreshold), 1, 99999),
+        WaveLimit = math.clamp(math.floor(tonumber(decoded.WaveLimit) or Defaults.WaveLimit), 1, 500),
+        WindowX = tonumber(decoded.WindowX) or Defaults.WindowX,
+        WindowY = tonumber(decoded.WindowY) or Defaults.WindowY,
+        Minimized = decoded.Minimized == true,
+        Closed = decoded.Closed == true,
+    }
+end
+
+local function SavePanicConfig(cfg)
+    if not HasFilesystem then return end
+    pcall(function()
+        writefile(PANIC_CONFIG, HttpService:JSONEncode(cfg))
+    end)
+end
+
+-- ============================================================
+-- Auto-Execute (queue on teleport)
+-- ============================================================
+local function GetQueueOnTeleport()
+    if type(queue_on_teleport) == "function" then return queue_on_teleport end
+    if type(queueonteleport) == "function" then return queueonteleport end
+    if type(syn) == "table" and type(syn.queue_on_teleport) == "function" then
+        return syn.queue_on_teleport
+    end
+    if type(fluxus) == "table" and type(fluxus.queue_on_teleport) == "function" then
+        return fluxus.queue_on_teleport
+    end
+    return nil
+end
+
+local function QueuePanicOnTeleport()
+    local queue = GetQueueOnTeleport()
+    if not queue then return false end
+    local queuedSource = [[
+if not game:IsLoaded() then game.Loaded:Wait() end
+task.wait(2)
+local hubURL = "https://raw.githubusercontent.com/KeroTwT/Kero-Hub/refs/heads/main/Slop%20TD"
+local addonURL = "https://raw.githubusercontent.com/YOU/YOUR-REPO/main/SlopTD_PanicSell.lua"
+pcall(function()
+    local source = game:HttpGet(hubURL)
+    local chunk = loadstring(source)
+    if chunk then chunk() end
+end)
+task.wait(1)
+pcall(function()
+    local source = game:HttpGet(addonURL)
+    local chunk = loadstring(source)
+    if chunk then chunk() end
+end)
+]]
+    return pcall(queue, queuedSource)
+end
+
+-- ============================================================
+-- Wait for hub
+-- ============================================================
+local function WaitForHub(timeout)
+    local deadline = os.clock() + (timeout or 60)
+    while os.clock() < deadline do
+        local hub = getgenv().SlopTDHub
+        if hub and hub.State and type(hub.State) == "table" and hub.State.Running then
+            return hub
+        end
+        task.wait(0.2)
+    end
+    return nil
+end
+
+local Hub = WaitForHub(60)
+if not Hub then
+    warn("[Panic Sell] Slop TD Hub did not load within 60s. Aborting.")
+    return
+end
+
+local State = Hub.State
+
+-- ============================================================
+-- Attach persisted values
+-- ============================================================
+local SavedCfg = LoadPanicConfig()
+
+if State.AutoSellLowHp == nil then
+    State.AutoSellLowHp = SavedCfg.Enabled
+end
+if State.AutoSellLowHpThreshold == nil then
+    State.AutoSellLowHpThreshold = SavedCfg.HpThreshold
+end
+if State.AutoSellLowHpWaveLimit == nil then
+    State.AutoSellLowHpWaveLimit = SavedCfg.WaveLimit
+end
+if State.AutoSellLowHpTriggeredSerial == nil then
+    State.AutoSellLowHpTriggeredSerial = -1
+end
+
+local WindowX = SavedCfg.WindowX
+local WindowY = SavedCfg.WindowY
+local Minimized = SavedCfg.Minimized
+local Closed = SavedCfg.Closed
+
+local lastSaved = {}
+local function SnapshotState()
+    return {
+        Enabled = State.AutoSellLowHp,
+        HpThreshold = State.AutoSellLowHpThreshold,
+        WaveLimit = State.AutoSellLowHpWaveLimit,
+        WindowX = WindowX,
+        WindowY = WindowY,
+        Minimized = Minimized,
+        Closed = Closed,
+    }
+end
+
+local function PersistIfChanged()
+    local cur = SnapshotState()
+    local changed = false
+    for k, v in pairs(cur) do
+        if lastSaved[k] ~= v then changed = true break end
+    end
+    if changed then
+        lastSaved = cur
+        SavePanicConfig(cur)
+    end
+end
+
+lastSaved = SnapshotState()
+
+-- ============================================================
+-- Getters
+-- ============================================================
+local function GetInfoFolder()
+    return Workspace:FindFirstChild("Info")
+end
+
+local function GetWave()
+    local info = GetInfoFolder()
+    local w = info and info:FindFirstChild("Wave")
+    return (w and w:IsA("ValueBase") and tonumber(w.Value)) or 0
+end
+
+local function IsGameRunning()
+    local info = GetInfoFolder()
+    local r = info and info:FindFirstChild("GameRunning")
+    return r and r:IsA("ValueBase") and r.Value == true
+end
+
+local function GetBaseHealthText()
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local gg = pg and pg:FindFirstChild("GameGui")
+    local info = gg and gg:FindFirstChild("Info")
+    local health = info and info:FindFirstChild("Health")
+    local title = health and health:FindFirstChild("Title")
+    if title and (title:IsA("TextLabel") or title:IsA("TextButton")) then
+        return tostring(title.Text or "")
+    end
+    return "Unknown"
+end
+
+local function GetBaseHealthNumber()
+    local text = GetBaseHealthText()
+    if text == "Unknown" or text == "" then return nil end
+    local cleaned = tostring(text):gsub(",", ""):gsub("%s", "")
+    local num, suffix = cleaned:match("^([%d%.]+)([KkMmBb]?)")
+    num = tonumber(num)
+    if not num then return nil end
+    local mult = { K = 1e3, M = 1e6, B = 1e9 }
+    if suffix and suffix ~= "" then
+        num = num * (mult[suffix:upper()] or 1)
+    end
+    return num
+end
+
+-- ============================================================
+-- Sell logic
+-- ============================================================
+local function SellAllOwnTowers()
+    local Functions = ReplicatedStorage:FindFirstChild("Functions")
+    local SellRemote = Functions and Functions:FindFirstChild("SellTower")
+    if not SellRemote then return false, "SellTower remote missing" end
+
+    local towers = Workspace:FindFirstChild("Towers")
+    if not towers then return false, "Towers folder missing" end
+
+    local sold, failed = 0, 0
+    for _ = 1, 5 do
+        local targets = {}
+        for _, tower in ipairs(towers:GetChildren()) do
+            local config = tower:FindFirstChild("Config")
+            local owner = config and config:FindFirstChild("Owner")
+            if owner and tostring(owner.Value) == LocalPlayer.Name then
+                table.insert(targets, tower)
+            end
+        end
+        if #targets == 0 then break end
+        for _, tower in ipairs(targets) do
+            if tower.Parent then
+                local ok, accepted = pcall(SellRemote.InvokeServer, SellRemote, tower)
+                if ok and accepted ~= false then
+                    sold = sold + 1
+                else
+                    failed = failed + 1
+                end
+                task.wait(0.06)
+            end
+        end
+        task.wait(0.15)
+    end
+    return true, string.format("Sold %d | Failed %d", sold, failed)
+end
+
+local function Notify(title, content)
+    pcall(function()
+        local WindUI = getgenv().WindUI
+        if WindUI and WindUI.Notify then
+            WindUI:Notify({ Title = title, Content = content, Duration = 5, Icon = "bell" })
+        end
+    end)
+    print(string.format("[Panic Sell] %s: %s", tostring(title), tostring(content)))
+end
+
+-- ============================================================
+-- Watchdog
+-- ============================================================
+task.spawn(function()
+    while State.Running do
+        local active = IsGameRunning() and GetWave() >= 1
+        local wave = GetWave()
+
+        local panicActive = active
+            and State.AutoSellLowHp
+            and wave <= State.AutoSellLowHpWaveLimit
+
+        if panicActive and not State.AutoSellBusy
+            and State.AutoSellLowHpTriggeredSerial ~= State.MatchSerial then
+
+            local hp = GetBaseHealthNumber()
+            if hp and hp < State.AutoSellLowHpThreshold then
+                State.AutoSellLowHpTriggeredSerial = State.MatchSerial
+                State.AutoSellBusy = true
+
+                Notify("Panic Sell",
+                    string.format("Base HP %d < %d at wave %d",
+                        math.floor(hp), State.AutoSellLowHpThreshold, wave))
+
+                local ok, detail = SellAllOwnTowers()
+                State.AutoSellBusy = false
+
+                if ok then
+                    Notify("Panic Sell complete", detail)
+                else
+                    Notify("Panic Sell incomplete", detail)
+                    if State.Running and IsGameRunning() then
+                        State.AutoSellLowHpTriggeredSerial = -1
+                    end
+                end
+            end
+        end
+
+        PersistIfChanged()
+        task.wait(0.5)
+    end
+end)
+
+task.spawn(function()
+    local lastSerial = State.MatchSerial
+    while State.Running do
+        if State.MatchSerial ~= lastSerial then
+            lastSerial = State.MatchSerial
+            State.AutoSellLowHpTriggeredSerial = -1
+        end
+        task.wait(0.5)
+    end
+end)
+
+-- ============================================================
+-- UI
+-- ============================================================
+local Window, MinimizeBtn, CloseBtn, ReopenBtn, Body
+
+local function UpdateMinimizeVisual()
+    if not Body then return end
+    Body.Visible = not Minimized
+    if Window then
+        Window.Size = Minimized and UDim2.fromOffset(240, 32) or UDim2.fromOffset(240, 170)
+    end
+    if MinimizeBtn then
+        MinimizeBtn.Text = Minimized and "+" or "—"
+    end
+end
+
+local function UpdateCloseVisual()
+    if Window then Window.Visible = not Closed end
+    if ReopenBtn then ReopenBtn.Visible = Closed end
+end
+
+local function MakeControlPanel()
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not pg then pg = LocalPlayer:WaitForChild("PlayerGui") end
+
+    local existing = pg:FindFirstChild("SlopTDPanicSell")
+    if existing then existing:Destroy() end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "SlopTDPanicSell"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+    -- ============ Main Window ============
+    local frame = Instance.new("Frame")
+    frame.Name = "Window"
+    frame.Size = UDim2.fromOffset(240, 170)
+    frame.Position = UDim2.fromOffset(WindowX, WindowY)
+    frame.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
+    frame.BorderSizePixel = 0
+    frame.Active = true
+    frame.Parent = gui
+    Window = frame
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 10)
+    corner.Parent = frame
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(60, 220, 130)
+    stroke.Thickness = 1.5
+    stroke.Transparency = 0.4
+    stroke.Parent = frame
+
+    local shadow = Instance.new("ImageLabel")
+    shadow.Name = "Shadow"
+    shadow.AnchorPoint = Vector2.new(0.5, 0.5)
+    shadow.Position = UDim2.fromScale(0.5, 0.5)
+    shadow.Size = UDim2.new(1, 30, 1, 30)
+    shadow.BackgroundTransparency = 1
+    shadow.Image = "rbxassetid://6014261993"
+    shadow.ImageColor3 = Color3.new(0, 0, 0)
+    shadow.ImageTransparency = 0.6
+    shadow.ZIndex = 0
+    shadow.Parent = frame
+
+    -- ============ Title Bar ============
+    local titleBar = Instance.new("Frame")
+    titleBar.Name = "TitleBar"
+    titleBar.Size = UDim2.new(1, 0, 0, 32)
+    titleBar.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+    titleBar.BorderSizePixel = 0
+    titleBar.Parent = frame
+
+    local tbCorner = Instance.new("UICorner")
+    tbCorner.CornerRadius = UDim.new(0, 10)
+    tbCorner.Parent = titleBar
+
+    -- Cover the bottom corners so the top stays rounded
+    local tbMask = Instance.new("Frame")
+    tbMask.Size = UDim2.new(1, 0, 0, 10)
+    tbMask.Position = UDim2.new(0, 0, 1, -10)
+    tbMask.BackgroundColor3 = titleBar.BackgroundColor3
+    tbMask.BorderSizePixel = 0
+    tbMask.Parent = titleBar
+
+    local titleText = Instance.new("TextLabel")
+    titleText.Size = UDim2.new(1, -70, 1, 0)
+    titleText.Position = UDim2.fromOffset(10, 0)
+    titleText.BackgroundTransparency = 1
+    titleText.Text = "Panic Sell"
+    titleText.TextColor3 = Color3.fromRGB(240, 240, 240)
+    titleText.Font = Enum.Font.GothamBold
+    titleText.TextSize = 14
+    titleText.TextXAlignment = Enum.TextXAlignment.Left
+    titleText.Parent = titleBar
+
+    -- Minimize button
+    MinimizeBtn = Instance.new("TextButton")
+    MinimizeBtn.Size = UDim2.fromOffset(24, 24)
+    MinimizeBtn.Position = UDim2.new(1, -56, 0, 4)
+    MinimizeBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+    MinimizeBtn.Text = "—"
+    MinimizeBtn.TextColor3 = Color3.fromRGB(240, 240, 240)
+    MinimizeBtn.Font = Enum.Font.GothamBold
+    MinimizeBtn.TextSize = 14
+    MinimizeBtn.BorderSizePixel = 0
+    MinimizeBtn.Parent = titleBar
+
+    local minCorner = Instance.new("UICorner")
+    minCorner.CornerRadius = UDim.new(0, 6)
+    minCorner.Parent = MinimizeBtn
+
+    -- Close button
+    CloseBtn = Instance.new("TextButton")
+    CloseBtn.Size = UDim2.fromOffset(24, 24)
+    CloseBtn.Position = UDim2.new(1, -28, 0, 4)
+    CloseBtn.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+    CloseBtn.Text = "✕"
+    CloseBtn.TextColor3 = Color3.fromRGB(240, 240, 240)
+    CloseBtn.Font = Enum.Font.GothamBold
+    CloseBtn.TextSize = 13
+    CloseBtn.BorderSizePixel = 0
+    CloseBtn.Parent = titleBar
+
+    local closeCorner = Instance.new("UICorner")
+    closeCorner.CornerRadius = UDim.new(0, 6)
+    closeCorner.Parent = CloseBtn
+
+    -- ============ Body ============
+    Body = Instance.new("Frame")
+    Body.Name = "Body"
+    Body.Size = UDim2.new(1, 0, 1, -32)
+    Body.Position = UDim2.fromOffset(0, 32)
+    Body.BackgroundTransparency = 1
+    Body.Parent = frame
+
+    -- Enable/Disable toggle
+    local toggle = Instance.new("TextButton")
+    toggle.Size = UDim2.new(1, -20, 0, 28)
+    toggle.Position = UDim2.fromOffset(10, 8)
+    toggle.BackgroundColor3 = State.AutoSellLowHp and Color3.fromRGB(46, 180, 92) or Color3.fromRGB(50, 50, 60)
+    toggle.TextColor3 = Color3.fromRGB(240, 240, 240)
+    toggle.Font = Enum.Font.GothamSemibold
+    toggle.TextSize = 13
+    toggle.Text = State.AutoSellLowHp and "Enabled" or "Disabled"
+    toggle.BorderSizePixel = 0
+    toggle.Parent = Body
+
+    local toggleCorner = Instance.new("UICorner")
+    toggleCorner.CornerRadius = UDim.new(0, 6)
+    toggleCorner.Parent = toggle
+
+    toggle.MouseButton1Click:Connect(function()
+        State.AutoSellLowHp = not State.AutoSellLowHp
+        toggle.Text = State.AutoSellLowHp and "Enabled" or "Disabled"
+        toggle.BackgroundColor3 = State.AutoSellLowHp and Color3.fromRGB(46, 180, 92) or Color3.fromRGB(50, 50, 60)
+        PersistIfChanged()
+    end)
+
+    -- HP Threshold row
+    local hpRow = Instance.new("Frame")
+    hpRow.Size = UDim2.new(1, -20, 0, 26)
+    hpRow.Position = UDim2.fromOffset(10, 42)
+    hpRow.BackgroundColor3 = Color3.fromRGB(32, 32, 40)
+    hpRow.BorderSizePixel = 0
+    hpRow.Parent = Body
+
+    local hpCorner = Instance.new("UICorner")
+    hpCorner.CornerRadius = UDim.new(0, 6)
+    hpCorner.Parent = hpRow
+
+    local hpLabel = Instance.new("TextLabel")
+    hpLabel.Size = UDim2.new(0.6, 0, 1, 0)
+    hpLabel.Position = UDim2.fromOffset(8, 0)
+    hpLabel.BackgroundTransparency = 1
+    hpLabel.Text = "HP Threshold"
+    hpLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
+    hpLabel.Font = Enum.Font.Gotham
+    hpLabel.TextSize = 12
+    hpLabel.TextXAlignment = Enum.TextXAlignment.Left
+    hpLabel.Parent = hpRow
+
+    local hpValue = Instance.new("TextButton")
+    hpValue.Size = UDim2.new(0.4, -8, 1, -6)
+    hpValue.Position = UDim2.new(0.6, 0, 0, 3)
+    hpValue.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+    hpValue.Text = tostring(State.AutoSellLowHpThreshold)
+    hpValue.TextColor3 = Color3.fromRGB(240, 240, 240)
+    hpValue.Font = Enum.Font.GothamSemibold
+    hpValue.TextSize = 12
+    hpValue.BorderSizePixel = 0
+    hpValue.Parent = hpRow
+
+    local hpValCorner = Instance.new("UICorner")
+    hpValCorner.CornerRadius = UDim.new(0, 4)
+    hpValCorner.Parent = hpValue
+
+    hpValue.MouseButton1Click:Connect(function()
+        local presets = { 25, 50, 75, 99, 150, 250, 500, 1000, 2500 }
+        local idx = 1
+        for i, v in ipairs(presets) do
+            if State.AutoSellLowHpThreshold <= v then idx = i break end
+        end
+        State.AutoSellLowHpThreshold = presets[(idx % #presets) + 1]
+        hpValue.Text = tostring(State.AutoSellLowHpThreshold)
+        PersistIfChanged()
+    end)
+
+    -- Wave Limit row
+    local waveRow = Instance.new("Frame")
+    waveRow.Size = UDim2.new(1, -20, 0, 26)
+    waveRow.Position = UDim2.fromOffset(10, 74)
+    waveRow.BackgroundColor3 = Color3.fromRGB(32, 32, 40)
+    waveRow.BorderSizePixel = 0
+    waveRow.Parent = Body
+
+    local waveCorner = Instance.new("UICorner")
+    waveCorner.CornerRadius = UDim.new(0, 6)
+    waveCorner.Parent = waveRow
+
+    local waveLabel = Instance.new("TextLabel")
+    waveLabel.Size = UDim2.new(0.6, 0, 1, 0)
+    waveLabel.Position = UDim2.fromOffset(8, 0)
+    waveLabel.BackgroundTransparency = 1
+    waveLabel.Text = "Wave Limit"
+    waveLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
+    waveLabel.Font = Enum.Font.Gotham
+    waveLabel.TextSize = 12
+    waveLabel.TextXAlignment = Enum.TextXAlignment.Left
+    waveLabel.Parent = waveRow
+
+    local waveValue = Instance.new("TextButton")
+    waveValue.Size = UDim2.new(0.4, -8, 1, -6)
+    waveValue.Position = UDim2.new(0.6, 0, 0, 3)
+    waveValue.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+    waveValue.Text = tostring(State.AutoSellLowHpWaveLimit)
+    waveValue.TextColor3 = Color3.fromRGB(240, 240, 240)
+    waveValue.Font = Enum.Font.GothamSemibold
+    waveValue.TextSize = 12
+    waveValue.BorderSizePixel = 0
+    waveValue.Parent = waveRow
+
+    local waveValCorner = Instance.new("UICorner")
+    waveValCorner.CornerRadius = UDim.new(0, 4)
+    waveValCorner.Parent = waveValue
+
+    waveValue.MouseButton1Click:Connect(function()
+        local presets = { 10, 20, 30, 49, 75, 100, 150, 200, 300 }
+        local idx = 1
+        for i, v in ipairs(presets) do
+            if State.AutoSellLowHpWaveLimit <= v then idx = i break end
+        end
+        State.AutoSellLowHpWaveLimit = presets[(idx % #presets) + 1]
+        waveValue.Text = tostring(State.AutoSellLowHpWaveLimit)
+        PersistIfChanged()
+    end)
+
+    -- Status line
+    local status = Instance.new("TextLabel")
+    status.Size = UDim2.new(1, -20, 0, 20)
+    status.Position = UDim2.fromOffset(10, 108)
+    status.BackgroundTransparency = 1
+    status.Text = "Idle"
+    status.TextColor3 = Color3.fromRGB(150, 150, 160)
+    status.Font = Enum.Font.Gotham
+    status.TextSize = 11
+    status.TextXAlignment = Enum.TextXAlignment.Left
+    status.Parent = Body
+
+    -- Live status updater
+    task.spawn(function()
+        while status.Parent do
+            local active = IsGameRunning() and GetWave() >= 1
+            if not State.AutoSellLowHp then
+                status.Text = "Disabled"
+                status.TextColor3 = Color3.fromRGB(150, 150, 160)
+            elseif not active then
+                status.Text = "Waiting for match"
+                status.TextColor3 = Color3.fromRGB(150, 150, 160)
+            else
+                local wave = GetWave()
+                if wave > State.AutoSellLowHpWaveLimit then
+                    status.Text = "Wave past limit"
+                    status.TextColor3 = Color3.fromRGB(200, 160, 60)
+                else
+                    local hp = GetBaseHealthNumber()
+                    if hp then
+                        status.Text = string.format("HP: %d (wave %d)", math.floor(hp), wave)
+                        if hp < State.AutoSellLowHpThreshold then
+                            status.TextColor3 = Color3.fromRGB(230, 80, 80)
+                        else
+                            status.TextColor3 = Color3.fromRGB(150, 200, 150)
+                        end
+                    else
+                        status.Text = "Wave " .. tostring(wave)
+                        status.TextColor3 = Color3.fromRGB(150, 150, 160)
+                    end
+                end
+            end
+            task.wait(0.4)
+        end
+    end)
+
+    -- ============ Reopen button ============
+    ReopenBtn = Instance.new("TextButton")
+    ReopenBtn.Name = "ReopenBtn"
+    ReopenBtn.Size = UDim2.fromOffset(90, 28)
+    ReopenBtn.Position = UDim2.fromOffset(WindowX, WindowY)
+    ReopenBtn.BackgroundColor3 = Color3.fromRGB(46, 180, 92)
+    ReopenBtn.Text = "Panic Sell"
+    ReopenBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    ReopenBtn.Font = Enum.Font.GothamSemibold
+    ReopenBtn.TextSize = 12
+    ReopenBtn.BorderSizePixel = 0
+    ReopenBtn.Visible = Closed
+    ReopenBtn.Parent = gui
+
+    local reopenCorner = Instance.new("UICorner")
+    reopenCorner.CornerRadius = UDim.new(0, 6)
+    reopenCorner.Parent = ReopenBtn
+
+    ReopenBtn.MouseButton1Click:Connect(function()
+        Closed = false
+        UpdateCloseVisual()
+        PersistIfChanged()
+    end)
+
+    -- ============ Dragging ============
+    local dragging = false
+    local dragStart, startPos
+
+    titleBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = frame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    WindowX = frame.Position.X.Offset
+                    WindowY = frame.Position.Y.Offset
+                    PersistIfChanged()
+                end
+            end)
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+
+    -- Same for reopen button
+    local reopenDragging = false
+    local reopenDragStart, reopenStartPos
+
+    ReopenBtn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            reopenDragging = true
+            reopenDragStart = input.Position
+            reopenStartPos = ReopenBtn.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    reopenDragging = false
+                    WindowX = ReopenBtn.Position.X.Offset
+                    WindowY = ReopenBtn.Position.Y.Offset
+                    PersistIfChanged()
+                end
+            end)
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if reopenDragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - reopenDragStart
+            ReopenBtn.Position = UDim2.new(
+                reopenStartPos.X.Scale, reopenStartPos.X.Offset + delta.X,
+                reopenStartPos.Y.Scale, reopenStartPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+
+    -- ============ Buttons ============
+    MinimizeBtn.MouseButton1Click:Connect(function()
+        Minimized = not Minimized
+        UpdateMinimizeVisual()
+        PersistIfChanged()
+    end)
+
+    CloseBtn.MouseButton1Click:Connect(function()
+        Closed = true
+        UpdateCloseVisual()
+        PersistIfChanged()
+    end)
+
+    -- Hover effects
+    local function addHover(btn, baseColor, hoverColor)
+        btn.MouseEnter:Connect(function() btn.BackgroundColor3 = hoverColor end)
+        btn.MouseLeave:Connect(function() btn.BackgroundColor3 = baseColor end)
+    end
+    addHover(MinimizeBtn, Color3.fromRGB(50, 50, 60), Color3.fromRGB(70, 70, 85))
+    addHover(CloseBtn, Color3.fromRGB(180, 50, 50), Color3.fromRGB(220, 70, 70))
+    addHover(ReopenBtn, Color3.fromRGB(46, 180, 92), Color3.fromRGB(60, 200, 110))
+
+    -- Apply saved state
+    UpdateMinimizeVisual()
+    UpdateCloseVisual()
+
+    gui.Parent = pg
+end
+
+MakeControlPanel()
+QueuePanicOnTeleport()
+
+print("[Panic Sell] Addon v2 loaded. Drag title bar to move, — to minimize, ✕ to close.")
