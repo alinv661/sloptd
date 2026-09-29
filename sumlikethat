@@ -1,4 +1,4 @@
--- Slop TD Panic Sell Addon v2 (Movable + Minimizable + Persistent)
+-- Slop TD Panic Sell Addon v3 (Robust queue + movable window + persistence)
 -- Drop this in your executor's autoexecute folder.
 
 local Players = game:GetService("Players")
@@ -10,10 +10,12 @@ local CoreGui = game:GetService("CoreGui")
 
 local LocalPlayer = Players.LocalPlayer
 
--- Prevent double-launch (e.g. autoexecute + queued-on-teleport firing together)
+-- ============================================================
+-- Duplicate-launch guard (addon only, never the hub)
+-- ============================================================
 local genv = getgenv()
 if genv.__PanicSellLoading then
-    warn("[Panic Sell] Duplicate concurrent launch blocked")
+    warn("[Panic Sell] Addon already loading, skipping duplicate")
     return
 end
 genv.__PanicSellLoading = true
@@ -73,7 +75,10 @@ local function SavePanicConfig(cfg)
 end
 
 -- ============================================================
--- Auto-Execute (queue ONLY the addon on teleport, never the hub)
+-- Queue on teleport
+--   - Only runs the hub if it isn't already loaded/booting.
+--   - ALWAYS runs the addon, regardless of hub state.
+--   - The addon itself is responsible for waiting for the hub.
 -- ============================================================
 local function GetQueueOnTeleport()
     if type(queue_on_teleport) == "function" then return queue_on_teleport end
@@ -90,20 +95,27 @@ end
 local function QueuePanicOnTeleport()
     local queue = GetQueueOnTeleport()
     if not queue then return false end
+
     local queuedSource = [[
 if not game:IsLoaded() then game.Loaded:Wait() end
-task.wait(3)
+task.wait(2)
 
--- Wait for the hub's own boot flag to clear so we don't race it.
--- The hub sets __SlopTDHubBoot.Loading = false when it finishes loading.
+-- Run the hub only if nothing is already loading/loaded
 local boot = getgenv().__SlopTDHubBoot
-local deadline = os.clock() + 60
-while boot and boot.Loading == true and os.clock() < deadline do
-    task.wait(0.3)
-    boot = getgenv().__SlopTDHubBoot
+local hubReady = getgenv().SlopTDHub ~= nil
+local hubBooting = boot and boot.Loading == true
+
+if not hubReady and not hubBooting then
+    local hubURL = "https://raw.githubusercontent.com/KeroTwT/Kero-Hub/refs/heads/main/Slop%20TD"
+    pcall(function()
+        local source = game:HttpGet(hubURL)
+        local chunk = loadstring(source)
+        if chunk then chunk() end
+    end)
+    task.wait(2)
 end
 
--- Only fetch the addon. Do NOT re-run the hub here — the hub auto-executes itself.
+-- Always run the addon. It waits for the hub internally.
 local addonURL = "https://raw.githubusercontent.com/alinv661/sloptd/refs/heads/main/sumlikethat"
 pcall(function()
     local source = game:HttpGet(addonURL)
@@ -115,28 +127,35 @@ end)
 end
 
 -- ============================================================
--- Wait for hub
+-- Wait for the hub (patient — up to 3 minutes)
 -- ============================================================
 local function WaitForHub(timeout)
-    local deadline = os.clock() + (timeout or 60)
+    local deadline = os.clock() + (timeout or 180)
     while os.clock() < deadline do
         local hub = getgenv().SlopTDHub
         if hub and hub.State and type(hub.State) == "table" and hub.State.Running then
             return hub
         end
-        task.wait(0.2)
+        task.wait(0.3)
     end
     return nil
 end
 
-local Hub = WaitForHub(60)
+local Hub = WaitForHub(180)
 if not Hub then
-    warn("[Panic Sell] Slop TD Hub did not load within 60s. Aborting.")
+    warn("[Panic Sell] Slop TD Hub did not appear within 180s. Aborting.")
     genv.__PanicSellLoading = false
     return
 end
 
 local State = Hub.State
+
+-- Clear a potentially stuck boot flag so nothing else trips on it
+local boot = genv.__SlopTDHubBoot
+if boot and boot.Loading == true then
+    boot.Loading = false
+    boot.ReadyAt = os.clock()
+end
 
 -- ============================================================
 -- Attach persisted values
@@ -492,6 +511,7 @@ local function MakeControlPanel()
         PersistIfChanged()
     end)
 
+    -- HP Threshold row
     local hpRow = Instance.new("Frame")
     hpRow.Size = UDim2.new(1, -20, 0, 26)
     hpRow.Position = UDim2.fromOffset(10, 42)
@@ -540,6 +560,7 @@ local function MakeControlPanel()
         PersistIfChanged()
     end)
 
+    -- Wave Limit row
     local waveRow = Instance.new("Frame")
     waveRow.Size = UDim2.new(1, -20, 0, 26)
     waveRow.Position = UDim2.fromOffset(10, 74)
@@ -588,6 +609,7 @@ local function MakeControlPanel()
         PersistIfChanged()
     end)
 
+    -- Status line
     local status = Instance.new("TextLabel")
     status.Size = UDim2.new(1, -20, 0, 20)
     status.Position = UDim2.fromOffset(10, 108)
@@ -632,6 +654,7 @@ local function MakeControlPanel()
         end
     end)
 
+    -- Reopen button
     ReopenBtn = Instance.new("TextButton")
     ReopenBtn.Name = "ReopenBtn"
     ReopenBtn.Size = UDim2.fromOffset(90, 28)
@@ -655,6 +678,7 @@ local function MakeControlPanel()
         PersistIfChanged()
     end)
 
+    -- Dragging the window
     local dragging = false
     local dragStart, startPos
 
@@ -686,6 +710,7 @@ local function MakeControlPanel()
         end
     end)
 
+    -- Dragging the reopen button
     local reopenDragging = false
     local reopenDragStart, reopenStartPos
 
@@ -729,6 +754,7 @@ local function MakeControlPanel()
         PersistIfChanged()
     end)
 
+    -- Hover effects
     local function addHover(btn, baseColor, hoverColor)
         btn.MouseEnter:Connect(function() btn.BackgroundColor3 = hoverColor end)
         btn.MouseLeave:Connect(function() btn.BackgroundColor3 = baseColor end)
@@ -746,7 +772,7 @@ end
 MakeControlPanel()
 QueuePanicOnTeleport()
 
--- Release the guard so a future run (e.g. after a manual re-execute) works.
+-- Release the addon guard so it can reattach on the next join/teleport.
 genv.__PanicSellLoading = false
 
-print("[Panic Sell] Addon v2 loaded. Drag title bar to move, — to minimize, ✕ to close.")
+print("[Panic Sell] Addon v3 loaded. Drag title bar to move, — to minimize, ✕ to close.")
